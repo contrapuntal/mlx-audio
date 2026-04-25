@@ -316,6 +316,179 @@ class TestModelSanitize(unittest.TestCase):
         sanitized = self.model.sanitize(weights)
         self.assertEqual(len(sanitized), 0)
 
+    # Pointwise-conv regression cases. PyTorch (out, in, *kernel) shapes
+    # whose trailing dim is small (1, etc.) are easy to misclassify by
+    # any shape-only heuristic. With sentinel-key-based detection these
+    # must transpose to MLX layout because no MLX-converted sentinel
+    # appears in the dict.
+    def test_conv1d_pointwise_transpose(self):
+        weights = {"encoder.x.conv.pointwise.weight": mx.zeros((64, 32, 1))}
+        sanitized = self.model.sanitize(weights)
+        self.assertEqual(
+            sanitized["encoder.conformer.x.conv.pointwise.weight"].shape, (64, 1, 32)
+        )
+
+    def test_conv2d_pointwise_transpose(self):
+        weights = {"encoder.x.conv.weight": mx.zeros((256, 256, 1, 1))}
+        sanitized = self.model.sanitize(weights)
+        self.assertEqual(
+            sanitized["encoder.conformer.x.conv.weight"].shape, (256, 1, 1, 256)
+        )
+
+    def test_conv2d_kw1_transpose(self):
+        # PyTorch first conv with kernel (3, 1): (out=64, in=1, kH=3, kW=1).
+        weights = {"encoder.x.conv.weight": mx.zeros((64, 1, 3, 1))}
+        sanitized = self.model.sanitize(weights)
+        self.assertEqual(
+            sanitized["encoder.conformer.x.conv.weight"].shape, (64, 3, 1, 1)
+        )
+
+
+class TestModelSanitizeMLXConverted(unittest.TestCase):
+    """Sanitize support for canary-mlx-converted canary checkpoints.
+
+    The only public converter producing MLX-format canary weights is
+    canary-mlx (https://github.com/QuentinFuxa/canary-mlx); public
+    examples include `eelcor/canary-1b-v2-mlx` and
+    `Mediform/canary-1b-v2-mlx-q8`. Its `convert_nemo.py` rewrites raw
+    NeMo decoder keys into a different naming convention and stores
+    conv weights in MLX layout. The sanitize must:
+
+      1. Map alt-named decoder keys to the same internal namespace.
+      2. Skip the conv transpose (weights are already in MLX layout).
+
+    The two behaviors are linked: detection happens once via sentinel
+    prefixes, and gates both the alt-naming branches and the
+    conv-transpose skip.
+
+    Each test below uses an MLX-format sanitize input that includes at
+    least one alt-naming sentinel key to trigger the detection.
+    """
+
+    def setUp(self):
+        self.config = _small_model_config()
+        self.model = Model(self.config)
+        # Sentinel that flags the dict as MLX-converted.
+        self._sentinel = {
+            "transf_decoder.token_embedding.weight": mx.zeros((1, 1)),
+        }
+
+    def _sanitize(self, weights):
+        return self.model.sanitize({**self._sentinel, **weights})
+
+    # Alt-naming cases (these would silently fall through `load_weights(
+    # strict=False)` on pristine main, leaving the decoder partially
+    # uninitialized).
+
+    def test_token_embedding_no_infix(self):
+        out = self._sanitize({})  # sentinel itself is the test key
+        self.assertIn("decoder.embedding.weight", out)
+
+    def test_embedding_layer_norm_no_infix(self):
+        out = self._sanitize(
+            {"transf_decoder.embedding_layer_norm.weight": mx.zeros((32,))}
+        )
+        self.assertIn("decoder.embedding_layer_norm.weight", out)
+
+    def test_decoder_layers_alt_self_attn_names(self):
+        weights = {
+            "transf_decoder.layers.0.first_sub_layer.linear_q.weight": mx.zeros(
+                (32, 32)
+            ),
+            "transf_decoder.layers.0.first_sub_layer.linear_k.weight": mx.zeros(
+                (32, 32)
+            ),
+            "transf_decoder.layers.0.first_sub_layer.linear_v.weight": mx.zeros(
+                (32, 32)
+            ),
+            "transf_decoder.layers.0.first_sub_layer.linear_out.weight": mx.zeros(
+                (32, 32)
+            ),
+        }
+        out = self._sanitize(weights)
+        for tail in ("q_proj", "k_proj", "v_proj", "out_proj"):
+            self.assertIn(f"decoder.blocks.0.self_attn.{tail}.weight", out)
+
+    def test_decoder_layers_alt_cross_attn_names(self):
+        weights = {
+            "transf_decoder.layers.1.second_sub_layer.linear_q.weight": mx.zeros(
+                (32, 32)
+            ),
+            "transf_decoder.layers.1.second_sub_layer.linear_k.weight": mx.zeros(
+                (32, 32)
+            ),
+            "transf_decoder.layers.1.second_sub_layer.linear_v.weight": mx.zeros(
+                (32, 32)
+            ),
+            "transf_decoder.layers.1.second_sub_layer.linear_out.weight": mx.zeros(
+                (32, 32)
+            ),
+        }
+        out = self._sanitize(weights)
+        for tail in ("q_proj", "k_proj", "v_proj", "out_proj"):
+            self.assertIn(f"decoder.blocks.1.cross_attn.{tail}.weight", out)
+
+    def test_decoder_layers_alt_layer_norm_names(self):
+        # MLX-converted layer norms use the same `layer_norm_{1,2,3}`
+        # suffixes as raw NeMo, but live under the alt-naming
+        # `transf_decoder.layers.<i>.` (no `_decoder.` infix) namespace.
+        weights = {
+            "transf_decoder.layers.2.layer_norm_1.weight": mx.zeros((32,)),
+            "transf_decoder.layers.2.layer_norm_2.weight": mx.zeros((32,)),
+            "transf_decoder.layers.2.layer_norm_3.weight": mx.zeros((32,)),
+        }
+        out = self._sanitize(weights)
+        self.assertIn("decoder.blocks.2.self_attn_norm.weight", out)
+        self.assertIn("decoder.blocks.2.cross_attn_norm.weight", out)
+        self.assertIn("decoder.blocks.2.ff_norm.weight", out)
+
+    def test_decoder_layers_alt_ff_names(self):
+        weights = {
+            "transf_decoder.layers.0.third_sub_layer.linear1.weight": mx.zeros(
+                (64, 32)
+            ),
+            "transf_decoder.layers.0.third_sub_layer.linear2.weight": mx.zeros(
+                (32, 64)
+            ),
+        }
+        out = self._sanitize(weights)
+        self.assertIn("decoder.blocks.0.ff1.weight", out)
+        self.assertIn("decoder.blocks.0.ff2.weight", out)
+
+    def test_final_layer_norm_no_infix(self):
+        out = self._sanitize(
+            {"transf_decoder.final_layer_norm.weight": mx.zeros((32,))}
+        )
+        self.assertIn("decoder.final_norm.weight", out)
+
+    def test_head_classifier_to_output_proj(self):
+        out = self._sanitize({"head.classifier.weight": mx.zeros((64, 32))})
+        self.assertIn("decoder.output_proj.weight", out)
+
+    # Conv-layout cases. With the sentinel present, conv weights must
+    # NOT be transposed - they are already in MLX layout.
+
+    def test_4d_conv_passes_through(self):
+        out = self._sanitize(
+            {"encoder.subsampling.conv.weight": mx.zeros((256, 3, 3, 1))}
+        )
+        self.assertEqual(
+            out["encoder.conformer.subsampling.conv.weight"].shape, (256, 3, 3, 1)
+        )
+
+    def test_4d_conv_with_in_channels_passes_through(self):
+        # MLX layout where in_channels is a typical 32, not a sentinel value.
+        out = self._sanitize({"encoder.block.conv.weight": mx.zeros((64, 3, 3, 32))})
+        self.assertEqual(
+            out["encoder.conformer.block.conv.weight"].shape, (64, 3, 3, 32)
+        )
+
+    def test_3d_conv_passes_through(self):
+        out = self._sanitize({"encoder.depthwise.conv.weight": mx.zeros((1024, 9, 1))})
+        self.assertEqual(
+            out["encoder.conformer.depthwise.conv.weight"].shape, (1024, 9, 1)
+        )
+
 
 class TestModel(unittest.TestCase):
 

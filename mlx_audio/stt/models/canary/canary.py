@@ -266,6 +266,34 @@ class Model(nn.Module):
         """Map NeMo weight names to MLX weight names."""
         sanitized = {}
 
+        # Detect MLX-converted checkpoint format up front. The only
+        # public converter producing MLX-format canary weights today is
+        # canary-mlx (https://github.com/QuentinFuxa/canary-mlx, the
+        # `convert_nemo.py` script). It rewrites raw NeMo decoder keys
+        # into a different convention (linear_q/k/v/out instead of
+        # query_net/key_net/value_net/out_projection, head.classifier
+        # instead of log_softmax.mlp.layer0, etc.) AND stores conv
+        # weights in MLX layout (out, *kernel, in) rather than PyTorch
+        # (out, in, *kernel). Public weights converted this way include
+        # eelcor/canary-1b-v2-mlx and Mediform/canary-1b-v2-mlx-q8.
+        # Both naming and layout differences track together - any of
+        # the decoder sentinel prefixes below imply the full convention.
+        # If canary-mlx changes its naming, this detection silently
+        # stops matching; that is acceptable because mlx-audio's own
+        # canary loader expects raw NeMo names anyway.
+        is_mlx_converted_checkpoint = any(
+            k.startswith(
+                (
+                    "transf_decoder.token_embedding.",
+                    "transf_decoder.embedding_layer_norm.",
+                    "transf_decoder.layers.",
+                    "transf_decoder.final_layer_norm.",
+                    "head.classifier.",
+                )
+            )
+            for k in weights
+        )
+
         for key, value in weights.items():
             new_key = key
 
@@ -293,18 +321,46 @@ class Model(nn.Module):
                     "decoder.embedding_layer_norm.",
                 )
 
-            elif key.startswith("transf_decoder._decoder.layers."):
-                rest = key[len("transf_decoder._decoder.layers.") :]
+            # Alternative layout (used by some MLX-converted checkpoints, e.g. canary-1b-v2-mlx-fp32):
+            #   - no `_embedding.` infix on token_embedding / embedding_layer_norm
+            #   - no `_decoder.` infix on layers / final_layer_norm
+            #   - linear_q/k/v/out instead of query_net/key_net/value_net/out_projection
+            #   - linear1/linear2 instead of dense_in/dense_out
+            #   - head.classifier.* instead of log_softmax.mlp.layer0.*
+            elif key.startswith("transf_decoder.token_embedding."):
+                new_key = key.replace(
+                    "transf_decoder.token_embedding.", "decoder.embedding."
+                )
+
+            elif key.startswith("transf_decoder.embedding_layer_norm."):
+                new_key = key.replace(
+                    "transf_decoder.embedding_layer_norm.",
+                    "decoder.embedding_layer_norm.",
+                )
+
+            elif key.startswith("transf_decoder._decoder.layers.") or (
+                key.startswith("transf_decoder.layers.")
+            ):
+                if key.startswith("transf_decoder._decoder.layers."):
+                    rest = key[len("transf_decoder._decoder.layers.") :]
+                else:
+                    rest = key[len("transf_decoder.layers.") :]
                 parts = rest.split(".", 1)
                 layer_idx = parts[0]
                 sub_rest = parts[1]
 
                 if sub_rest.startswith("first_sub_layer."):
                     inner = sub_rest[len("first_sub_layer.") :]
+                    # NeMo names
                     inner = inner.replace("query_net.", "self_attn.q_proj.")
                     inner = inner.replace("key_net.", "self_attn.k_proj.")
                     inner = inner.replace("value_net.", "self_attn.v_proj.")
                     inner = inner.replace("out_projection.", "self_attn.out_proj.")
+                    # Alt names (linear_*)
+                    inner = inner.replace("linear_q.", "self_attn.q_proj.")
+                    inner = inner.replace("linear_k.", "self_attn.k_proj.")
+                    inner = inner.replace("linear_v.", "self_attn.v_proj.")
+                    inner = inner.replace("linear_out.", "self_attn.out_proj.")
                     new_key = f"decoder.blocks.{layer_idx}.{inner}"
 
                 elif sub_rest.startswith("second_sub_layer."):
@@ -313,12 +369,18 @@ class Model(nn.Module):
                     inner = inner.replace("key_net.", "cross_attn.k_proj.")
                     inner = inner.replace("value_net.", "cross_attn.v_proj.")
                     inner = inner.replace("out_projection.", "cross_attn.out_proj.")
+                    inner = inner.replace("linear_q.", "cross_attn.q_proj.")
+                    inner = inner.replace("linear_k.", "cross_attn.k_proj.")
+                    inner = inner.replace("linear_v.", "cross_attn.v_proj.")
+                    inner = inner.replace("linear_out.", "cross_attn.out_proj.")
                     new_key = f"decoder.blocks.{layer_idx}.{inner}"
 
                 elif sub_rest.startswith("third_sub_layer."):
                     inner = sub_rest[len("third_sub_layer.") :]
                     inner = inner.replace("dense_in.", "ff1.")
                     inner = inner.replace("dense_out.", "ff2.")
+                    inner = inner.replace("linear1.", "ff1.")
+                    inner = inner.replace("linear2.", "ff2.")
                     new_key = f"decoder.blocks.{layer_idx}.{inner}"
 
                 elif sub_rest.startswith("layer_norm_1."):
@@ -336,8 +398,16 @@ class Model(nn.Module):
                     "transf_decoder._decoder.final_layer_norm.", "decoder.final_norm."
                 )
 
+            elif key.startswith("transf_decoder.final_layer_norm."):
+                new_key = key.replace(
+                    "transf_decoder.final_layer_norm.", "decoder.final_norm."
+                )
+
             elif key.startswith("log_softmax.mlp.layer0."):
                 new_key = key.replace("log_softmax.mlp.layer0.", "decoder.output_proj.")
+
+            elif key.startswith("head.classifier."):
+                new_key = key.replace("head.classifier.", "decoder.output_proj.")
 
             if "attn_dropout" in key or "layer_dropout" in key:
                 continue
@@ -347,10 +417,18 @@ class Model(nn.Module):
                 continue
 
             if "conv" in new_key and "weight" in new_key and value.ndim >= 3:
-                if value.ndim == 3:
-                    value = mx.transpose(value, (0, 2, 1))
-                elif value.ndim == 4:
-                    value = mx.transpose(value, (0, 2, 3, 1))
+                # Convert PyTorch layout (C_out, C_in, *kernel) -> MLX layout
+                # (C_out, *kernel, C_in) for raw NeMo checkpoints. MLX-converted
+                # checkpoints already store conv weights in MLX layout, so skip
+                # the transpose entirely for them - detected via sentinel keys
+                # above, not by guessing from shape (shape-based heuristics are
+                # ambiguous for pointwise convs where kH=kW=1 or kW=1, which
+                # are valid in both layouts).
+                if not is_mlx_converted_checkpoint:
+                    if value.ndim == 4:
+                        value = mx.transpose(value, (0, 2, 3, 1))
+                    elif value.ndim == 3:
+                        value = mx.transpose(value, (0, 2, 1))
 
             sanitized[new_key] = value
 
