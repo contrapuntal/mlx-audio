@@ -6,10 +6,13 @@ and can be resolved by package managers using importlib.metadata.
 
 import shutil
 import subprocess
+import tomllib
 from importlib.metadata import PackageNotFoundError, metadata
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 # Find project root (where pyproject.toml lives)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -65,6 +68,17 @@ def run_dry_run(extra: str = None) -> subprocess.CompletedProcess:
 
 class TestOptionalDeps:
     """Test that optional dependency groups resolve correctly."""
+
+    def test_transformers_range_keeps_omlx_compatible(self):
+        """The core range must retain the Transformers version tested by oMLX."""
+        data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
+        dependency = next(
+            dep
+            for dep in data["project"]["dependencies"]
+            if Requirement(dep).name == "transformers"
+        )
+
+        assert Version("5.12.1") in Requirement(dependency).specifier
 
     def test_core_deps_defined(self):
         """Verify core dependencies are defined."""
